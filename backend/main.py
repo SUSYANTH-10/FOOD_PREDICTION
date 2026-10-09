@@ -1,123 +1,221 @@
-from fastapi import FastAPI, HTTPException
+# backend/main.py
+import os
+import joblib
+import pandas as pd
+import numpy as np
+from datetime import date
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import numpy as np
-from sklearn.ensemble import RandomForestRegressor
-import math
+from sqlalchemy.orm import Session
 
+import models
+import database
+
+# 1. Initialize FastAPI Application
 app = FastAPI(
-    title="AI Food Demand & Waste Analytics Microservice",
-    version="1.1.0"
+    title="Intelligent Food Demand Prediction API",
+    description="Backend API providing ML-driven food demand forecasting, safety preparation buffers, and database logging.",
+    version="1.0.0",
 )
 
-# Enable CORS for Next.js Frontend Communication
+# Enable CORS for Next.js Frontend Integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Adjust in production
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["*"],  # Allows GET, POST, OPTIONS, etc.
     allow_headers=["*"],
 )
 
-# Dynamic Menu Database containing Prices (INR), Unit Metadata, and CO2 factors (kg CO2e / portion)
-MENU_DB = {
-    "Chicken Rice": {"price": 120, "unit": "plates", "co2_factor": 2.40, "demand_ratio": 0.45},
-    "Egg Rice": {"price": 80, "unit": "plates", "co2_factor": 1.10, "demand_ratio": 0.38},
-    "Special Meals": {"price": 100, "unit": "plates", "co2_factor": 0.85, "demand_ratio": 0.35},
-    "Veg Biryani": {"price": 90, "unit": "plates", "co2_factor": 0.75, "demand_ratio": 0.32},
-    "Medu Vada (2 pcs)": {"price": 30, "unit": "sets", "co2_factor": 0.35, "demand_ratio": 0.25},
-}
+# 2. Automatically Create Database Tables on Application Startup
+models.Base.metadata.create_all(bind=database.engine)
 
-# --- Model Bootstrapping ---
-# Mock dataset for initializing Random Forest Regressor
-X_dummy = np.array([
-    [100, 200, 0, 0],
-    [150, 300, 0, 1],
-    [80,  150, 1, 0],
-    [200, 400, 0, 0],
-    [120, 250, 1, 1],
-])
-y_dummy = np.array([105, 160, 70, 210, 110])
-rf_model = RandomForestRegressor(n_estimators=50, random_state=42)
-rf_model.fit(X_dummy, y_dummy)
+# 3. Load Machine Learning Model
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "rf_model.pkl")
 
+try:
+    model = joblib.load(MODEL_PATH)
+    print(f"Model successfully loaded from {MODEL_PATH}")
+except Exception as e:
+    model = None
+    print(f"Warning: Model file could not be loaded from {MODEL_PATH}. Error: {e}")
 
-# Input Schema
-class DemandPredictionRequest(BaseModel):
-    item_name: str = Field(..., example="Chicken Rice")
-    past_sales: int = Field(..., ge=0, example=150)
-    headcount: int = Field(..., ge=0, example=300)
-    prep_qty: int = Field(..., ge=0, example=180)
-    is_weekend: bool = Field(default=False)
-    is_rainy: bool = Field(default=False)
+# 4. Pydantic Schemas (API Request/Response Validation)
+class PredictionRequest(BaseModel):
+    item_name: str = Field(..., json_schema_extra={"example": "Chicken Rice"})
+    past_sales: int = Field(..., ge=0, json_schema_extra={"example": 150})
+    headcount: int = Field(..., ge=0, json_schema_extra={"example": 350})
+    prep_qty: int = Field(..., ge=0, json_schema_extra={"example": 180})
+    is_weekend: bool = Field(False, json_schema_extra={"example": False})
+    is_rainy: bool = Field(False, json_schema_extra={"example": True})
 
 
-# Output Schema
-class DemandPredictionResponse(BaseModel):
+class PredictionResponse(BaseModel):
     item_name: str
-    unit: str
     predicted_demand: int
     recommended_prep: int
-    surplus_qty: int
-    unit_price: float
-    financial_risk_inr: float
-    carbon_risk_kg: float
-    xai_reasoning: str
+    unit: str = "plates"
 
 
-@app.post("/api/v1/predict", response_model=DemandPredictionResponse)
-def predict_demand(payload: DemandPredictionRequest):
-    # Validate selected item against configured menu
-    if payload.item_name not in MENU_DB:
+class DailyLogCreate(BaseModel):
+    item_name: str
+    date: date
+    past_sales: int = Field(..., ge=0)
+    headcount: int = Field(..., ge=0)
+    prep_qty: int = Field(..., ge=0)
+    actual_sales: Optional[int] = Field(None, ge=0)
+    leftover_qty: Optional[int] = Field(None, ge=0)
+    is_weekend: bool = False
+    is_rainy: bool = False
+
+
+class DailyLogResponse(BaseModel):
+    id: int
+    date: str
+    item_name: str
+    past_sales: int
+    headcount: int
+    prep_qty: int
+    actual_sales: Optional[int]
+    leftover_qty: Optional[int]
+    is_weekend: bool
+    is_rainy: bool
+
+    class Config:
+        from_attributes = True
+
+
+# 5. Core API Endpoints
+
+@app.get("/")
+def read_root():
+    """Health check endpoint."""
+    return {
+        "status": "online",
+        "system": "Intelligent Food Demand Prediction API",
+        "version": "1.0.0"
+    }
+
+
+@app.post("/api/v1/predict", response_model=PredictionResponse)
+def predict_food_demand(payload: PredictionRequest):
+    """
+    ML Prediction Endpoint: Accepts demand factors, validates ranges,
+    runs Random Forest inference, and applies a safety preparation buffer.
+    """
+    if model is None:
+        raise HTTPException(status_code=500, detail="ML model is not loaded on server.")
+
+    # Business Logic Guardrail: Validate prep_qty bounds against input features
+    if payload.prep_qty < payload.past_sales:
         raise HTTPException(
-            status_code=400, 
-            detail=f"Item '{payload.item_name}' not configured in MENU_DB."
+            status_code=400,
+            detail="Invalid input bounds: prep_qty cannot be less than past_sales."
         )
 
-    item_meta = MENU_DB[payload.item_name]
+    # Format input DataFrame matching training feature columns
+    input_data = pd.DataFrame([{
+        "past_sales": payload.past_sales,
+        "headcount": payload.headcount,
+        "prep_qty": payload.prep_qty,
+        "is_weekend": int(payload.is_weekend),
+        "is_rainy": int(payload.is_rainy)
+    }])
 
-    # Feature Vector Construction
-    features = np.array([[
-        payload.past_sales,
-        payload.headcount,
-        1 if payload.is_weekend else 0,
-        1 if payload.is_rainy else 0
-    ]])
+    # Run Model Inference
+    raw_prediction = model.predict(input_data)[0]
+    predicted_demand = int(np.round(raw_prediction))
 
-    # Random Forest Model Base Prediction
-    raw_pred = float(rf_model.predict(features)[0])
-    
-    # Apply Dish-Specific Demand Elasticity Ratio
-    headcount_factor = payload.headcount * item_meta["demand_ratio"]
-    final_demand = int(round(0.55 * raw_pred + 0.45 * headcount_factor))
+    # Apply 5% Safety Preparation Buffer
+    recommended_prep = int(np.ceil(predicted_demand * 1.05))
 
-    # Apply Safety Buffer (+5% Ceil Margin)
-    recommended_prep = math.ceil(final_demand * 1.05)
-
-    # Calculate Surplus, Financial Risk, and Carbon Footprint Impact
-    surplus_qty = payload.prep_qty - final_demand
-    financial_risk = max(0, surplus_qty) * item_meta["price"]
-    carbon_risk = max(0, surplus_qty) * item_meta["co2_factor"]
-
-    # Generate Explainable AI (XAI) Insight
-    reasoning_parts = [f"Base demand estimated for {payload.item_name}."]
-    if payload.is_rainy:
-        reasoning_parts.append("Rainfall increases canteen retention (+10%).")
-    if payload.is_weekend:
-        reasoning_parts.append("Weekend schedule reduces baseline campus footfall (-25%).")
-    if payload.prep_qty > recommended_prep:
-        reasoning_parts.append(f"Planned prep ({payload.prep_qty}) exceeds recommended threshold ({recommended_prep}).")
-    else:
-        reasoning_parts.append("Planned prep quantity is within optimal operating limits.")
-
-    return DemandPredictionResponse(
+    return PredictionResponse(
         item_name=payload.item_name,
-        unit=item_meta["unit"],
-        predicted_demand=final_demand,
+        predicted_demand=predicted_demand,
         recommended_prep=recommended_prep,
-        surplus_qty=surplus_qty,
-        unit_price=float(item_meta["price"]),
-        financial_risk_inr=round(financial_risk, 2),
-        carbon_risk_kg=round(carbon_risk, 2),
-        xai_reasoning=" ".join(reasoning_parts)
+        unit="plates"
+    )
+
+
+# 6. Database API Routes (Analytics History & Staff Data Entry)
+
+@app.get("/api/v1/analytics/history", response_model=List[DailyLogResponse])
+def get_historical_logs(limit: int = 50, db: Session = Depends(database.get_db)):
+    """Fetch recent historical logs from SQLite database for analytics charts."""
+    logs = (
+        db.query(models.DailyLog)
+        .order_by(models.DailyLog.date.desc())
+        .limit(limit)
+        .all()
+    )
+
+    result = []
+    for log in logs:
+        result.append(
+            DailyLogResponse(
+                id=log.id,
+                date=str(log.date),
+                item_name=log.item.name if log.item else "Unknown",
+                past_sales=log.past_sales,
+                headcount=log.headcount,
+                prep_qty=log.prep_qty,
+                actual_sales=log.actual_sales,
+                leftover_qty=log.leftover_qty,
+                is_weekend=log.is_weekend,
+                is_rainy=log.is_rainy,
+            )
+        )
+    return result
+
+
+@app.post("/api/v1/logs", response_model=DailyLogResponse)
+def create_daily_log(payload: DailyLogCreate, db: Session = Depends(database.get_db)):
+    """
+    Staff Data Entry Endpoint: Allows canteen staff to submit daily kitchen records
+    directly into the database.
+    """
+    # Check if item exists in food_items table, or create a default catalog entry
+    food_item = db.query(models.FoodItem).filter(models.FoodItem.name == payload.item_name).first()
+    if not food_item:
+        food_item = models.FoodItem(name=payload.item_name, category="General", cost_per_unit_inr=50.0)
+        db.add(food_item)
+        db.commit()
+        db.refresh(food_item)
+
+    # Compute leftover_qty automatically if actual_sales is provided but leftovers is None
+    leftover = payload.leftover_qty
+    if payload.actual_sales is not None and leftover is None:
+        leftover = max(0, payload.prep_qty - payload.actual_sales)
+
+    # Instantiate database record
+    new_log = models.DailyLog(
+        date=payload.date,
+        item_id=food_item.id,
+        past_sales=payload.past_sales,
+        headcount=payload.headcount,
+        prep_qty=payload.prep_qty,
+        actual_sales=payload.actual_sales,
+        leftover_qty=leftover,
+        is_weekend=payload.is_weekend,
+        is_rainy=payload.is_rainy,
+    )
+
+    db.add(new_log)
+    db.commit()
+    db.refresh(new_log)
+
+    return DailyLogResponse(
+        id=new_log.id,
+        date=str(new_log.date),
+        item_name=food_item.name,
+        past_sales=new_log.past_sales,
+        headcount=new_log.headcount,
+        prep_qty=new_log.prep_qty,
+        actual_sales=new_log.actual_sales,
+        leftover_qty=new_log.leftover_qty,
+        is_weekend=new_log.is_weekend,
+        is_rainy=new_log.is_rainy,
     )

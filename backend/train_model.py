@@ -1,63 +1,58 @@
 import os
-import joblib
+import random
+import datetime
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+import joblib
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-def train_canteen_model():
-    csv_path = "canteen_data.csv"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(BASE_DIR, "canteen_data.csv")
+MODEL_PATH = os.path.join(BASE_DIR, "rf_model.pkl")
+
+def generate_and_train():
+    print("Generating synthetic canteen dataset...")
+    random.seed(42)
+    np.random.seed(42)
+
+    rows = []
+    items = ["Chicken Rice", "Veg Biryani", "Medu Vada"]
     
-    if not os.path.exists(csv_path):
-        print(f"❌ Error: '{csv_path}' not found! Run generate_data.py first.")
-        return
+    for i in range(500):
+        item = random.choice(items)
+        headcount = random.randint(200, 450)
+        past_sales = random.randint(100, 220)
+        prep_qty = past_sales + random.randint(10, 30)
+        is_weekend = random.choice([0, 1])
+        is_rainy = random.choice([0, 1])
 
-    print("📥 Loading dataset from canteen_data.csv...")
-    df = pd.read_csv(csv_path)
+        # Target formula with slight random noise
+        demand = past_sales + (headcount * 0.15) - (is_rainy * 10) + (is_weekend * 15)
+        demand = max(50, int(demand + np.random.normal(0, 5)))
 
-    # 1. Select the 4D Feature Vector (X) and Target (y)
-    X = df[["past_sales", "headcount", "is_weekend", "is_rainy"]]
-    y = df["actual_demand"]
+        rows.append({
+            "item_name": item,
+            "past_sales": past_sales,
+            "headcount": headcount,
+            "prep_qty": prep_qty,
+            "is_weekend": is_weekend,
+            "is_rainy": is_rainy,
+            "demand": demand
+        })
 
-    # 2. Perform an 80/20 Train-Test Split with a fixed random_state for reproducibility
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42
-    )
+    df = pd.DataFrame(rows)
+    df.to_csv(CSV_PATH, index=False)
+    print(f"Saved dataset to {CSV_PATH}")
 
-    print(f"📊 Dataset split: {len(X_train)} training records | {len(X_test)} test records.")
+    # Train Model
+    X = df[["past_sales", "headcount", "prep_qty", "is_weekend", "is_rainy"]]
+    y = df["demand"]
 
-    # 3. Instantiate and train the RandomForestRegressor
-    rf = RandomForestRegressor(
-        n_estimators=100,
-        max_depth=8,
-        min_samples_split=5,
-        random_state=42
-    )
-    
-    print("⏳ Training Random Forest Regressor...")
-    rf.fit(X_train, y_train)
+    rf = RandomForestRegressor(n_estimators=100, random_state=42)
+    rf.fit(X, y)
 
-    # 4. Predict on the unseen 20% test holdout set
-    y_pred = rf.predict(X_test)
-
-    # 5. Compute statistical metrics
-    mae = mean_absolute_error(y_test, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    r2 = r2_score(y_test, y_pred)
-
-    print("\n" + "=" * 45)
-    print("🎯 TEST SET EVALUATION METRICS:")
-    print("=" * 45)
-    print(f"  • MAE  (Mean Absolute Error) : {mae:.2f} plates")
-    print(f"  • RMSE (Root Mean Sq Error)  : {rmse:.2f} plates")
-    print(f"  • R² Score (Variance Ratio)  : {r2:.4f}")
-    print("=" * 45)
-
-    # 6. Save the trained model binary
-    model_output_path = "rf_model.pkl"
-    joblib.dump(rf, model_output_path)
-    print(f"\n✅ Model successfully trained and saved to '{model_output_path}'!")
+    joblib.dump(rf, MODEL_PATH)
+    print(f"Model successfully trained and saved to {MODEL_PATH}")
 
 if __name__ == "__main__":
-    train_canteen_model()
+    generate_and_train()
